@@ -1,11 +1,11 @@
 /*
-  8-Channel Analog IR Line Follower (Complete)
-  Sensor: Smartelex RLS08 (Using ALL 8 sensors: A0-A7)
+  5-Channel Analog IR Line Follower (REVISED & CORRECTED)
+  Sensor: Using 5 sensors (A0-A4)
   Motor Driver: TB6612FNG
   Controller: Arduino Nano
   
   *** HARDWARE ***
-  - Sensors 0-7 -> A0-A7
+  - Sensors 0-4 -> A0-A4
   - TB6612FNG STBY -> Arduino 5V
   - Left Motor -> D3, D2, D5
   - Right Motor -> D7, D4, D6
@@ -23,33 +23,37 @@
 #define button1 8   // Start Line Following
 #define button2 9   // Motor Direction Test
 #define button3 10  // Stop
-#define button4 11  // Auto Calibration
+#define button4 11  // Sensor Test
 
 // --- LEDs ---
 #define led13 13
 #define led12 12
 
-// --- Sensor Settings ---
-#define sensorNumber 8
-int sensor[sensorNumber];      
-int minValues[sensorNumber];   
-int maxValues[sensorNumber];   
-int threshold[sensorNumber];   
+// --- Sensor Settings (5 SENSORS) ---
+#define sensorNumber 5
+#define samples_to_average 5
 
-// --- Tuning Parameters (TUNE THESE) ---
-int kp = 35;              
-int kd = 280;             
+int sensor[sensorNumber];
+int raw_readings[sensorNumber][samples_to_average];
+
+// *** THRESHOLDS - UPDATED ***
+// Based on Serial Monitor: White is ~990, Black is ~180. 
+// Midpoint threshold is set to 585.
+int threshold[sensorNumber] = {585, 585, 585, 585, 585};
+
+// --- Tuning Parameters ---
+int kp = 20;              // Proportional gain
+int kd = 100;             // Derivative gain
 int max_speed = 230;      
 int left_motor_speed = 180;   
 int right_motor_speed = 180;  
 int turn_speed = 160;         
 
-// Delays to debounce noise at intersections
-#define stop_timer 30         
+#define stop_timer 30
 
 // --- PID Variables ---
-// Center of 8 sensors (0-7) is 3.5
-float center_point = 3.5;     
+// Center of 5 sensors (0-4) is 2.0
+float center_point = 2.0;     
 float calculated_pos;
 float error, previous_error;
 int PID;
@@ -57,7 +61,6 @@ int turn_value = 0; // 0=Straight, 1=Left, 2=Right
 
 // --- Button States ---
 bool button1_state = 1, button2_state = 1, button3_state = 1, button4_state = 1;
-bool calibrated = false;
 
 void setup() {
   // Motor Pins
@@ -65,7 +68,7 @@ void setup() {
   pinMode(rmf, OUTPUT); pinMode(rmb, OUTPUT);
   pinMode(rms, OUTPUT); pinMode(lms, OUTPUT);
 
-  // Sensor Pins (Analog)
+  // Sensor Pins (A0-A4 only)
   for(int i = 0; i < sensorNumber; i++) {
     pinMode(A0 + i, INPUT);
   }
@@ -79,39 +82,40 @@ void setup() {
   pinMode(led12, OUTPUT);
 
   Serial.begin(9600);
-  Serial.println("=== 8-Sensor Line Follower Ready ===");
+  Serial.println("=== 5-Sensor Line Follower Ready ===");
+  Serial.println("Button 4: Sensor Test | Button 1: Line Follow | Button 2: Motor Test | Button 3: Stop");
 }
 
 void loop() {
   button_status();
 
-  // Button 4: Auto Calibration
+  // Button 4: Sensor Test
   if (button4_state == LOW) {
-    calibrate_sensors(); // This now spins the bot
-    // Post-calibration sensor test loop
+    Serial.println("\n=== SENSOR TEST (5 Sensors) ===");
+    Serial.println("Move bot over white and black line...\n");
+    delay(500);
+    
     while(button4_state == LOW) {
-      sensor_test();
+      sensor_test_display();
       button_status();
     }
+    delay(300);
   }
 
   // Button 1: Start Line Follow
   if (button1_state == LOW) {
-    if (!calibrated) {
-      Serial.println("ERROR: Press Button 4 to Calibrate first!");
-      for(int k=0; k<5; k++) { digitalWrite(led13, HIGH); delay(100); digitalWrite(led13, LOW); delay(100); }
-    } else {
-      Line_Follow();
-    }
+    Line_Follow();
+    delay(300);
   }
 
   // Button 2: Motor Test
   if (button2_state == LOW) {
-    Serial.println("Motor Test: Spinning Forward");
+    Serial.println("Motor Test: Forward 1 second");
     motor(120, 120);
     delay(1000);
     motor(0, 0);
     delay(500);
+    delay(300);
   }
 }
 
@@ -122,97 +126,100 @@ void button_status() {
   button4_state = digitalRead(button4);
 }
 
-// --- Auto Calibration (Spins 360) ---
-void calibrate_sensors() {
-  Serial.println("\n=== AUTO CALIBRATION START ===");
-  digitalWrite(led12, HIGH);
-  
-  // Initialize min/max
-  for(int i = 0; i < sensorNumber; i++) {
-    minValues[i] = 1023; 
-    maxValues[i] = 0;    
-  }
-
-  // Start Spinning
-  int cal_speed = 130; // Adjust if bot spins too fast/slow
-  motor(cal_speed, -cal_speed); 
-
-  unsigned long startTime = millis();
-  // Spin for 4 seconds
-  while (millis() - startTime < 4000) {
-    for(int i = 0; i < sensorNumber; i++) {
-      int val = analogRead(A0 + i);
-      if (val > maxValues[i]) maxValues[i] = val;
-      if (val < minValues[i]) minValues[i] = val;
-    }
-  }
-
-  motor(0, 0);
-  digitalWrite(led12, LOW);
-
-  // Calculate Thresholds
-  for(int i = 0; i < sensorNumber; i++) {
-    threshold[i] = (minValues[i] + maxValues[i]) / 2;
-  }
-
-  calibrated = true;
-  Serial.println("Calibration Complete.");
-}
-
-// --- Sensor Reading & Normalization ---
+// --- Read Sensors with Averaging & Filtering ---
 void read_sensor() {
-  int raw_reading;
   float weighted_sum = 0;
   int active_sensors = 0;
   
   for (int i = 0; i < sensorNumber; i++) {
-    raw_reading = analogRead(A0 + i);
+    // Take multiple samples and average
+    int sum = 0;
+    for(int s = 0; s < samples_to_average; s++) {
+      sum += analogRead(A0 + i);
+      delayMicroseconds(50);
+    }
+    int avg_reading = sum / samples_to_average;
     
-    // Normalize to 0-1000
-    sensor[i] = map(raw_reading, minValues[i], maxValues[i], 0, 1000);
-    sensor[i] = constrain(sensor[i], 0, 1000);
+    // Apply threshold: Black = 1000, White = 0
+    if(avg_reading < threshold[i]) {
+      sensor[i] = 1000;  // Black line detected
+    } else {
+      sensor[i] = 0;     // White surface
+    }
     
     weighted_sum += (float)sensor[i] * i;
     active_sensors += sensor[i];
   }
   
-  // Avoid division by zero
-  if (active_sensors > 100) {
+  // Calculate position (0 = leftmost, 2.0 = center, 4 = rightmost)
+  if (active_sensors > 0) {
     calculated_pos = weighted_sum / active_sensors;
+  } else {
+    calculated_pos = 2.0; // Default to center
   }
 }
 
-// --- Debugging Display ---
-void sensor_test() {
-  read_sensor();
-  Serial.print("Pos: "); Serial.print(calculated_pos);
+// --- Sensor Test Display ---
+void sensor_test_display() {
+  read_sensor();  // <-- FIX: Added this so calculated_pos updates before printing
+
+  Serial.print("Pos: ");
+  Serial.print(calculated_pos, 1);
   Serial.print(" | ");
-  for (int i = 0; i < sensorNumber; i++) {
-    Serial.print(sensor[i]); Serial.print("\t");
+  
+  // Read raw values
+  for(int i = 0; i < sensorNumber; i++) {
+    int raw = analogRead(A0 + i);
+    
+    // Display as [B] for black or [W] for white
+    if(raw < threshold[i]) {
+      Serial.print("[B]");
+    } else {
+      Serial.print("[W]");
+    }
+    Serial.print(raw); Serial.print("\t");
   }
   Serial.println();
-  delay(100);
+  delay(200);
 }
 
 // --- Motor Drive ---
 void motor(int left, int right) {
-  if (right > 0) { digitalWrite(rmf, HIGH); digitalWrite(rmb, LOW); }
-  else { right = -right; digitalWrite(rmf, LOW); digitalWrite(rmb, HIGH); }
+  // Set direction for right motor
+  if (right > 0) {
+    digitalWrite(rmf, HIGH);
+    digitalWrite(rmb, LOW);
+  } else {
+    right = -right;
+    digitalWrite(rmf, LOW);
+    digitalWrite(rmb, HIGH);
+  }
 
-  if (left > 0) { digitalWrite(lmf, HIGH); digitalWrite(lmb, LOW); }
-  else { left = -left; digitalWrite(lmf, LOW); digitalWrite(lmb, HIGH); }
+  // Set direction for left motor
+  if (left > 0) {
+    digitalWrite(lmf, HIGH);
+    digitalWrite(lmb, LOW);
+  } else {
+    left = -left;
+    digitalWrite(lmf, LOW);
+    digitalWrite(lmb, HIGH);
+  }
 
+  // Constrain speeds
   left = constrain(left, 0, max_speed);
   right = constrain(right, 0, max_speed);
 
+  // Set PWM speeds
   analogWrite(lms, left);
   analogWrite(rms, right);
 }
 
-// --- MAIN ALGORITHM ---
+// --- MAIN LINE FOLLOWING ALGORITHM ---
 void Line_Follow() {
-  Serial.println("LINE FOLLOWING STARTED");
+  Serial.println("\n=== LINE FOLLOWING STARTED ===");
   digitalWrite(led13, HIGH);
+  
+  previous_error = 0;
   
   while (1) {
     read_sensor();
@@ -229,11 +236,11 @@ void Line_Follow() {
 
     // 2. Turn Memory Logic
     // Leftmost sensor (0) sees black -> Remember Left Turn
-    if (sensor[0] > 600 && sensor[7] < 400) {
+    if (sensor[0] > 500 && sensor[4] < 500) {
       turn_value = 1; 
     }
-    // Rightmost sensor (7) sees black -> Remember Right Turn
-    if (sensor[7] > 600 && sensor[0] < 400) {
+    // Rightmost sensor (4) sees black -> Remember Right Turn
+    if (sensor[4] > 500 && sensor[0] < 500) {
       turn_value = 2; 
     }
 
@@ -248,36 +255,37 @@ void Line_Follow() {
       
       // Case A: Sharp Left (based on memory)
       if (turn_value == 1) { 
+        Serial.println("LEFT TURN");
         motor(-turn_speed, turn_speed); // Spin Left
-        // Wait until middle sensors (3 or 4) see the line
+        // Wait until middle sensors see the line
         do {
           read_sensor();
-        } while (sensor[3] < 500 && sensor[4] < 500); 
+        } while (sensor[1] < 500 && sensor[2] < 500 && sensor[3] < 500); 
         turn_value = 0;
       }
       
       // Case B: Sharp Right (based on memory)
       else if (turn_value == 2) { 
+        Serial.println("RIGHT TURN");
         motor(turn_speed, -turn_speed); // Spin Right
         do {
           read_sensor();
-        } while (sensor[3] < 500 && sensor[4] < 500);
+        } while (sensor[1] < 500 && sensor[2] < 500 && sensor[3] < 500);
         turn_value = 0;
       }
       
-      // Case C: U-Turn (Dead End)
+      // Case C: U-Turn (Dead End / No Memory)
       else { 
+        Serial.println("U-TURN");
         motor(turn_speed, -turn_speed); // Spin Right (default)
         do {
           read_sensor();
-        } while (sensor[3] < 500 && sensor[4] < 500);
+        } while (sensor[1] < 500 && sensor[2] < 500 && sensor[3] < 500);
       }
     }
     
     // 5. Case: Stop Condition (All Black / T-intersection)
-    // Adjust logic depending on if you want to stop or cross T-intersections.
-    // Here we check if *most* sensors are black.
-    else if (sensor_sum >= 6) {
+    else if (sensor_sum >= 4) {
       delay(stop_timer);
       read_sensor();
       
@@ -288,16 +296,18 @@ void Line_Follow() {
       }
       
       // If still all black, STOP
-      if(sensor_sum >= 6) {
+      if(sensor_sum >= 4) {
         motor(0, 0);
-        Serial.println("STOP LINE DETECTED");
+        Serial.println("*** STOP LINE DETECTED ***");
         digitalWrite(led13, LOW);
         
-        // Wait here until line is cleared or just hang forever
-        while(sensor_sum >= 6) {
+        // Wait here until line is cleared
+        while(sensor_sum >= 4) {
           read_sensor();
-           sensor_sum = 0;
-           for(int i = 0; i < sensorNumber; i++) if(sensor[i]>500) sensor_sum++;
+          sensor_sum = 0;
+          for(int i = 0; i < sensorNumber; i++) {
+            if(sensor[i] > 500) sensor_sum++;
+          }
         }
       }
     }
